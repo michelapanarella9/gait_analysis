@@ -1,0 +1,374 @@
+"""
+Gait recognition camera pipeline (Raspberry Pi + IMX500 AI Camera)
+-------------------------------------------------------------------
+
+What this does, end to end:
+
+  1. The IMX500 sensor runs HigherHRNet pose estimation ON-CHIP (same way your
+     original script ran YOLOv8 object detection on-chip). The Pi CPU never
+     sees raw inference math, just the parsed keypoints -- this is the part
+     that makes gait recognition feasible on a Pi at all.
+
+  2. As a person is tracked, we buffer a rolling sequence of their per-frame
+     17-keypoint skeletons.
+
+  3. Once the buffer has enough frames, the sequence is handed to a
+     gait-recognition model (a checkpoint trained with OpenGait's
+     SkeletonGait, run here in eval/inference mode only -- no training on
+     the Pi) which outputs an embedding vector.
+
+  4. That embedding is compared against a small on-disk gallery of known
+     people's embeddings. A close match = identified; no close match =
+     unknown person, image saved for review (mirrors your old
+     allowed_objects.txt behaviour, just re-purposed for "known person" vs
+     "unknown person").
+
+IMPORTANT -- read before running:
+
+  - Steps 1-2 use the real, documented picamera2 / IMX500 API and should
+    work as-is once the higherhrnet .rpk model is on your Pi.
+  - Step 3 (`load_gait_model` / `run_gait_inference`) is deliberately left
+    as a clearly-marked integration point. I have not verified OpenGait's
+    exact internal class names/config schema against your checked-out copy
+    of the repo, and guessing at that would be more likely to silently
+    break than to help. Clone OpenGait, find the SkeletonGait model class
+    under `opengait/modeling/models/`, and wire it in where marked below.
+  - The keypoint normalization in `normalize_keypoints` is a reasonable
+    generic approach (center on hip midpoint, scale by torso length) but
+    MUST match whatever transform OpenGait's SkeletonGait dataloader
+    applies during training, or the embeddings won't be comparable to
+    anything you trained. Check `opengait/data/transform.py` and the
+    SkeletonGait config yaml for the exact recipe and mirror it here.
+  - Training happens on a PC/GPU, not on the Pi. This script only loads an
+    already-trained checkpoint and runs it forward.
+"""
+
+import os
+import sys
+import time
+import threading
+from collections import deque
+
+import numpy as np
+import cv2
+
+from picamera2 import CompletedRequest, MappedArray, Picamera2
+from picamera2.devices.imx500 import IMX500, NetworkIntrinsics
+from picamera2.devices.imx500.postprocess import COCODrawer
+from picamera2.devices.imx500.postprocess_highernet import postprocess_higherhrnet
+
+# -----------------------------
+# SETTINGS
+# -----------------------------
+
+POSE_MODEL_PATH = "/usr/share/imx500-models/imx500_network_higherhrnet_coco.rpk"
+
+# Path to your trained OpenGait SkeletonGait checkpoint (.pt / .pth)
+GAIT_CHECKPOINT_PATH = "./models/skeletongait_checkpoint.pt"
+
+# Folder of known-person embeddings: one .npy file per person, filename = name
+GALLERY_FOLDER = "./gallery"
+
+DETECTION_THRESHOLD = 0.3          # HigherHRNet keypoint/person confidence
+SEQUENCE_LENGTH = 30               # frames per gait sample (~3s at 10fps)
+TRACK_TIMEOUT_FRAMES = 15          # reset the buffer if nobody's seen this long
+MATCH_THRESHOLD = 0.75             # cosine similarity to call it a match
+
+SAVE_FOLDER = "./data/images"
+CAPTURE_COOLDOWN = 5               # seconds
+
+WINDOW_SIZE_H_W = (480, 640)       # must match your ISP output resolution
+
+# -----------------------------
+# GLOBALS
+# -----------------------------
+
+last_boxes = None
+last_scores = None
+last_keypoints = None
+
+keypoint_buffer = deque(maxlen=SEQUENCE_LENGTH)
+frames_since_person = 0
+
+last_capture_time = 0
+gait_model = None
+gallery = {}  # name -> embedding (np.ndarray)
+
+_inference_lock = threading.Lock()
+_inference_busy = False
+
+
+# -----------------------------
+# GAIT MODEL (INTEGRATION POINT)
+# -----------------------------
+
+def load_gait_model():
+    """
+    Load a pretrained OpenGait SkeletonGait checkpoint for inference only.
+
+    Fill this in against your actual OpenGait checkout, e.g. roughly:
+
+        import torch
+        sys.path.append("/path/to/OpenGait")
+        from opengait.modeling.models.skeletongait import SkeletonGait  # verify name
+
+        model = SkeletonGait(model_cfg=...)   # load cfg from your yaml
+        state = torch.load(GAIT_CHECKPOINT_PATH, map_location="cpu")
+        model.load_state_dict(state["model"] if "model" in state else state)
+        model.eval()
+        return model
+
+    Left unimplemented here on purpose -- see the module docstring.
+    """
+    raise NotImplementedError(
+        "Wire up your OpenGait SkeletonGait model + checkpoint here "
+        "(see load_gait_model docstring)."
+    )
+
+
+def normalize_keypoints(sequence):
+    """
+    sequence: np.ndarray, shape (T, 17, 3) -- (x, y, confidence) per COCO joint.
+
+    Generic normalization: center each frame on the hip midpoint and scale
+    by torso length, so the model sees gait shape, not absolute position or
+    the person's distance from the camera. Replace with OpenGait's exact
+    SkeletonGait preprocessing if it differs (it likely does).
+    """
+    seq = sequence.copy().astype(np.float32)
+    LEFT_HIP, RIGHT_HIP, LEFT_SHOULDER = 11, 12, 5
+
+    for t in range(seq.shape[0]):
+        frame = seq[t]
+        hip_mid = (frame[LEFT_HIP, :2] + frame[RIGHT_HIP, :2]) / 2.0
+        torso_len = np.linalg.norm(frame[LEFT_SHOULDER, :2] - hip_mid) or 1.0
+
+        frame[:, :2] -= hip_mid
+        frame[:, :2] /= torso_len
+
+    return seq
+
+
+def run_gait_inference(sequence):
+    """
+    sequence: np.ndarray, shape (SEQUENCE_LENGTH, 17, 3)
+    Returns: 1D np.ndarray embedding, or None if the model isn't loaded.
+    """
+    if gait_model is None:
+        return None
+
+    import torch  # local import so the rest of the script runs even if torch
+                   # isn't installed yet while you're testing the camera side
+
+    norm_seq = normalize_keypoints(sequence)
+    tensor = torch.from_numpy(norm_seq).unsqueeze(0)  # shape: (1, T, 17, 3)
+
+    with torch.no_grad():
+        embedding = gait_model(tensor)
+
+    return embedding.squeeze(0).cpu().numpy()
+
+
+def load_gallery():
+    gallery_dict = {}
+    if not os.path.isdir(GALLERY_FOLDER):
+        print(f"No gallery folder at {GALLERY_FOLDER}; every match will read as unknown.")
+        return gallery_dict
+
+    for fname in os.listdir(GALLERY_FOLDER):
+        if fname.endswith(".npy"):
+            name = os.path.splitext(fname)[0]
+            gallery_dict[name] = np.load(os.path.join(GALLERY_FOLDER, fname))
+
+    print(f"Loaded gallery: {list(gallery_dict.keys())}")
+    return gallery_dict
+
+
+def match_embedding(embedding):
+    """Return (best_name, similarity) or (None, 0.0) if nothing clears the threshold."""
+    if not gallery or embedding is None:
+        return None, 0.0
+
+    best_name, best_sim = None, -1.0
+    for name, ref in gallery.items():
+        sim = float(np.dot(embedding, ref) / (np.linalg.norm(embedding) * np.linalg.norm(ref) + 1e-8))
+        if sim > best_sim:
+            best_name, best_sim = name, sim
+
+    if best_sim >= MATCH_THRESHOLD:
+        return best_name, best_sim
+    return None, best_sim
+
+
+# -----------------------------
+# IMAGE SAVE
+# -----------------------------
+
+def save_image(tag="unknown"):
+    global last_capture_time
+
+    now = time.time()
+    if now - last_capture_time < CAPTURE_COOLDOWN:
+        return
+
+    date = time.strftime("%Y-%m-%d")
+    folder = f"{SAVE_FOLDER}/{date}"
+    os.makedirs(folder, exist_ok=True)
+
+    filename = time.strftime(f"%H-%M-%S_{tag}.jpg")
+    path = f"{folder}/{filename}"
+
+    picam2.capture_file(path)
+    print("Saved:", path)
+
+    last_capture_time = now
+
+
+# -----------------------------
+# POSE PARSING (mirrors picamera2's official HigherHRNet demo)
+# -----------------------------
+
+def ai_output_tensor_parse(metadata: dict):
+    global last_boxes, last_scores, last_keypoints
+
+    np_outputs = imx500.get_outputs(metadata=metadata, add_batch=True)
+
+    if np_outputs is not None:
+        keypoints, scores, boxes = postprocess_higherhrnet(
+            outputs=np_outputs,
+            img_size=WINDOW_SIZE_H_W,
+            img_w_pad=(0, 0),
+            img_h_pad=(0, 0),
+            detection_threshold=DETECTION_THRESHOLD,
+            network_postprocess=True,
+        )
+
+        if scores is not None and len(scores) > 0:
+            last_keypoints = np.reshape(np.stack(keypoints, axis=0), (len(scores), 17, 3))
+            last_boxes = [np.array(b) for b in boxes]
+            last_scores = np.array(scores)
+        else:
+            last_boxes, last_scores, last_keypoints = None, None, None
+
+    return last_boxes, last_scores, last_keypoints
+
+
+def draw_overlay(request: CompletedRequest, boxes, scores, keypoints, stream="main"):
+    with MappedArray(request, stream) as m:
+        if boxes is not None and len(boxes) > 0:
+            drawer.annotate_image(
+                m.array, boxes, scores, np.zeros(scores.shape), keypoints,
+                DETECTION_THRESHOLD, DETECTION_THRESHOLD,
+                request.get_metadata(), picam2, stream,
+            )
+
+
+def pre_callback(request: CompletedRequest):
+    boxes, scores, keypoints = ai_output_tensor_parse(request.get_metadata())
+    draw_overlay(request, boxes, scores, keypoints)
+
+
+# -----------------------------
+# GAIT INFERENCE (BACKGROUND THREAD)
+# -----------------------------
+
+def process_sequence_async(sequence):
+    global _inference_busy
+
+    def worker():
+        global _inference_busy
+        try:
+            embedding = run_gait_inference(sequence)
+            name, sim = match_embedding(embedding)
+
+            if name:
+                print(f"Identified: {name} (similarity {sim:.2f})")
+                save_image(tag=name)
+            else:
+                print(f"Unrecognized gait (best similarity {sim:.2f})")
+                save_image(tag="unknown")
+        except NotImplementedError as e:
+            print(f"[gait model not wired up yet] {e}")
+        finally:
+            with _inference_lock:
+                _inference_busy = False
+
+    with _inference_lock:
+        if _inference_busy:
+            return  # drop this sequence rather than queue up behind a slow model
+        _inference_busy = True
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# -----------------------------
+# MAIN
+# -----------------------------
+
+if __name__ == "__main__":
+
+    print("Loading pose model...")
+    imx500 = IMX500(POSE_MODEL_PATH)
+    intrinsics = imx500.network_intrinsics
+
+    if not intrinsics:
+        intrinsics = NetworkIntrinsics()
+        intrinsics.task = "pose estimation"
+    elif intrinsics.task != "pose estimation":
+        print("Model is not a pose estimation model")
+        sys.exit()
+
+    if intrinsics.inference_rate is None:
+        intrinsics.inference_rate = 10
+    if intrinsics.labels is None:
+        with open("assets/coco_labels.txt", "r") as f:
+            intrinsics.labels = f.read().splitlines()
+
+    intrinsics.update_with_defaults()
+
+    categories = [c for c in intrinsics.labels if c and c != "-"]
+    drawer = COCODrawer(categories, imx500, needs_rescale_coords=False)
+
+    picam2 = Picamera2(imx500.camera_num)
+    config = picam2.create_preview_configuration(
+        controls={"FrameRate": intrinsics.inference_rate}, buffer_count=12
+    )
+
+    imx500.show_network_fw_progress_bar()
+    picam2.start(config, show_preview=False)
+    imx500.set_auto_aspect_ratio()
+    picam2.pre_callback = pre_callback
+
+    print("Loading gait model...")
+    try:
+        gait_model = load_gait_model()
+    except NotImplementedError as e:
+        print(f"[warning] {e}")
+        print("Continuing with pose tracking only -- no gait matching will run.")
+        gait_model = None
+
+    gallery = load_gallery()
+
+    print("Gait recognition started")
+
+    while True:
+        metadata = picam2.capture_metadata()
+        boxes, scores, keypoints = ai_output_tensor_parse(metadata)
+
+        if keypoints is not None and len(keypoints) > 0:
+            # Single-person assumption: track whoever has the highest
+            # detection score. For multi-person scenes you'd need a proper
+            # tracker (e.g. IoU or ByteTrack) keyed on `boxes` to keep each
+            # person's sequence separate -- flagged here rather than guessed.
+            best_idx = int(np.argmax(scores))
+            keypoint_buffer.append(keypoints[best_idx])
+            frames_since_person = 0
+        else:
+            frames_since_person += 1
+            if frames_since_person > TRACK_TIMEOUT_FRAMES:
+                keypoint_buffer.clear()
+
+        if len(keypoint_buffer) == SEQUENCE_LENGTH:
+            sequence = np.stack(keypoint_buffer, axis=0)
+            process_sequence_async(sequence)
+            keypoint_buffer.clear()
