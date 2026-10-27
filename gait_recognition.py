@@ -399,7 +399,72 @@ def ai_output_tensor_parse(metadata: dict):
     return last_boxes, last_scores, last_keypoints
 
 
-def draw_overlay(request: CompletedRequest, boxes, scores, keypoints, metric_lines, anatomy_lines=None, stream="main"):
+def _draw_muscle_lines(frame, kp, observations, min_confidence=MIN_KEYPOINT_CONFIDENCE):
+    """Draw deliberately crude muscle-path estimates over the detected person.
+
+    These are teaching annotations inferred from pose landmarks, not measured
+    muscle boundaries, fibre lengths, or EMG activity.
+    """
+    import cv2
+
+    index = {
+        "left": {"shoulder": 5, "elbow": 7, "wrist": 9},
+        "right": {"shoulder": 6, "elbow": 8, "wrist": 10},
+    }
+
+    def point(side, joint):
+        p = kp[index[side][joint]]
+        if not np.all(np.isfinite(p)) or float(p[2]) < min_confidence:
+            return None
+        return np.asarray(p[:2], dtype=float)
+
+    for obs in observations:
+        side = obs["side"]
+        movement_id = obs["id"]
+        shoulder = point(side, "shoulder")
+        elbow = point(side, "elbow")
+        wrist = point(side, "wrist")
+        if shoulder is None or elbow is None:
+            continue
+
+        # Bright line with dark outline stays visible over different clothes.
+        if movement_id in ("elbow_flexion", "elbow_extension"):
+            upper_start = shoulder + 0.20 * (elbow - shoulder)
+            upper_end = shoulder + 0.88 * (elbow - shoulder)
+            cv2.line(frame, tuple(upper_start.astype(int)), tuple(upper_end.astype(int)), (0, 0, 0), 7)
+            cv2.line(frame, tuple(upper_start.astype(int)), tuple(upper_end.astype(int)), (0, 220, 255), 4)
+            if wrist is not None and movement_id == "elbow_flexion":
+                forearm_start = elbow + 0.12 * (wrist - elbow)
+                forearm_end = elbow + 0.72 * (wrist - elbow)
+                cv2.line(frame, tuple(forearm_start.astype(int)), tuple(forearm_end.astype(int)), (0, 0, 0), 6)
+                cv2.line(frame, tuple(forearm_start.astype(int)), tuple(forearm_end.astype(int)), (0, 220, 255), 3)
+            anchor = (int((upper_start[0] + upper_end[0]) / 2), int((upper_start[1] + upper_end[1]) / 2))
+        elif movement_id == "shoulder_abduction":
+            # A short approximate segment near the shoulder represents the deltoid region.
+            vector = elbow - shoulder
+            length = float(np.linalg.norm(vector))
+            if length < 1:
+                continue
+            perp = np.array([-vector[1], vector[0]]) / length
+            start = shoulder + 0.08 * vector + 0.07 * length * perp
+            end = shoulder + 0.42 * vector + 0.07 * length * perp
+            cv2.line(frame, tuple(start.astype(int)), tuple(end.astype(int)), (0, 0, 0), 7)
+            cv2.line(frame, tuple(start.astype(int)), tuple(end.astype(int)), (0, 220, 255), 4)
+            anchor = (int(end[0]), int(end[1]))
+        else:
+            # The wrist-below-elbow cue is positional only; don't imply a muscle is active.
+            continue
+
+        muscles = obs.get("muscles", [])
+        label = ", ".join(muscles[:2]) if muscles else obs.get("name", movement_id)
+        label = f"{side.upper()}: {label} (estimated)"
+        text_x = max(8, min(frame.shape[1] - 320, anchor[0] + 10))
+        text_y = max(24, min(frame.shape[0] - 8, anchor[1] - 8))
+        cv2.putText(frame, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (0, 0, 0), 3)
+        cv2.putText(frame, label, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (255, 255, 255), 1)
+
+
+def draw_overlay(request: CompletedRequest, boxes, scores, keypoints, metric_lines, anatomy_lines=None, observations=None, selected_keypoints=None, stream="main"):
     with MappedArray(request, stream) as m:
         if boxes is not None and len(boxes) > 0:
             drawer.annotate_image(
@@ -409,26 +474,42 @@ def draw_overlay(request: CompletedRequest, boxes, scores, keypoints, metric_lin
             )
 
         import cv2
-        # Deliberately show only one movement status line.
-        text = (anatomy_lines or ["Wrist pronation: NOT DETECTED"])[0]
-        cv2.putText(m.array, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 3)
-        cv2.putText(m.array, text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1)
+        if selected_keypoints is not None and observations:
+            _draw_muscle_lines(m.array, selected_keypoints, observations)
+
+        lines = anatomy_lines or ["No movement detected"]
+        for i, text in enumerate(lines[:4]):
+            y = 28 + i * 23
+            cv2.putText(m.array, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 3)
+            cv2.putText(m.array, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
 
 
 def pre_callback(request: CompletedRequest):
     boxes, scores, keypoints = ai_output_tensor_parse(request.get_metadata())
+    observations = []
+    selected_keypoints = None
+    status_lines = ["No movement detected"]
 
-    # This build intentionally displays only the requested movement.
-    status = "Wrist pronation: NOT DETECTED"
     if keypoints is not None and len(keypoints) > 0:
         best_idx = int(np.argmax(scores))
+        selected_keypoints = keypoints[best_idx]
         if anatomy_engine is not None:
-            observations = anatomy_engine.update(keypoints[best_idx], time.time())
-            sides = sorted({obs["side"] for obs in observations if obs["id"] == "wrist_pronation"})
-            if sides:
-                status = "Wrist pronation: DETECTED (" + ", ".join(sides) + ")"
+            observations = anatomy_engine.update(selected_keypoints, time.time())
 
-    draw_overlay(request, boxes, scores, keypoints, [], [status])
+        if observations:
+            status_lines = []
+            for obs in observations:
+                muscles = ", ".join(obs.get("muscles", [])[:3])
+                status_lines.append(f"{obs['side'].upper()} {obs['name']}: DETECTED")
+                if muscles:
+                    status_lines.append(f"Likely muscles: {muscles}")
+        else:
+            status_lines = ["No configured movement detected"]
+
+    draw_overlay(
+        request, boxes, scores, keypoints, [], status_lines,
+        observations=observations, selected_keypoints=selected_keypoints,
+    )
 
 
 # -----------------------------

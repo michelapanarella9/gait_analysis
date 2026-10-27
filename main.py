@@ -29,7 +29,9 @@ def main():
     gait.anatomy_engine = AnatomyEngine(
         movements, min_keypoint_confidence=gait.MIN_KEYPOINT_CONFIDENCE
     )
-    print("Movement enabled: Wrist pronation (wrist lower than elbow)")
+    print("Movement rules loaded:")
+    for movement in movements:
+        print(f"  - {movement['name']}")
 
     print("Loading IMX500 pose model...")
     gait.imx500 = IMX500(str(model_path))
@@ -63,8 +65,8 @@ def main():
     gait.imx500.set_auto_aspect_ratio()
     gait.picam2.pre_callback = gait.pre_callback
 
-    print("Live wrist-pronation display running. Ctrl+C to stop.")
-    print("The label appears when the wrist stays lower than the elbow.")
+    print("Live anatomy overlay running. Ctrl+C to stop.")
+    print("Muscle lines are rough teaching estimates based on detected pose landmarks.")
     try:
         while True:
             time.sleep(0.5)
