@@ -15,10 +15,11 @@ from collections import deque
 
 import cv2
 import numpy as np
+
 from picamera2 import CompletedRequest, MappedArray, Picamera2
 from picamera2.devices.imx500 import IMX500, NetworkIntrinsics
 from picamera2.devices.imx500.postprocess import COCODrawer
-from picamera2.devices.imx500.postprocess_higherhrnet import postprocess_higherhrnet
+from picamera2.devices.imx500.postprocess_highernet import postprocess_higherhrnet
 
 POSE_MODEL_PATH = "/usr/share/imx500-models/imx500_network_higherhrnet_coco.rpk"
 DETECTION_THRESHOLD = 0.3
@@ -89,7 +90,7 @@ def movement_trend(kps, side, now):
             old = a
             break
     if old is None:
-        trend = "COLLECTING"
+        trend = ""
     else:
         delta = angle - old
         # Smaller internal elbow angle = flexion; larger = extension.
@@ -102,7 +103,7 @@ def movement_trend(kps, side, now):
         elif now - last_trend_time[side] < 1.0 and last_trend[side] not in ("COLLECTING", "TRACKING LOST"):
             trend = last_trend[side]
         else:
-            trend = "NO CLEAR CHANGE"
+            trend = ""
     return angle, trend, shoulder, elbow, wrist
 
 
@@ -129,12 +130,12 @@ def draw_muscle_guide(img, shoulder, elbow, side, movement):
     offset = perp * max(3.0, min(9.0, length * 0.07))
     if movement == "ELBOW FLEXION":
         color = FLEXION_COLOR
-        label = "Biceps brachii / brachialis"
+        label = "Biceps brachii / brachialis (Musculocutaneous)"
         # A short line plus a small parallel accent to suggest a localized region.
         p1, p2 = start + offset, end + offset
     else:
         color = EXTENSION_COLOR
-        label = "Triceps brachii"
+        label = "Triceps brachii (Radial)"
         p1, p2 = start - offset, end - offset
     thickness = max(3, int(length * 0.035))
     cv2.line(img, tuple(np.round(p1).astype(int)), tuple(np.round(p2).astype(int)), color, thickness, cv2.LINE_AA)
@@ -193,6 +194,7 @@ def pre_callback(request: CompletedRequest):
 
             # Wrist y decreases as it moves up the image. Compare with ~0.65 s ago.
             wrist_rising = False
+            wrist_falling = False
             if wrist is not None:
                 hist = wrist_history[side]
                 hist.append((now, wrist[1]))
@@ -200,14 +202,18 @@ def pre_callback(request: CompletedRequest):
                     hist.popleft()
                 old_y = next((wy for t, wy in hist if now - t >= COMPARE_SECONDS), None)
                 wrist_rising = old_y is not None and old_y - wrist[1] >= WRIST_RISE_PIXELS
+                wrist_falling = old_y is not None and  WRIST_RISE_PIXELS >= old_y - wrist[1] 
+
 
             if angle is None:
                 status = f"{side.upper()}: {trend}"
             else:
                 status = f"{side.upper()}: elbow angle {angle:.0f} deg | {trend}"
             if wrist_rising:
-                status += " | ARM RISING (UPWARD-ROTATION ESTIMATE)"
-            put_text(img, status, (10, y), 0.43, FLEXION_COLOR if trend == "ELBOW FLEXION" else EXTENSION_COLOR if trend == "ELBOW EXTENSION" else WHITE)
+                status += " |SHOULDER ABDUCTION"
+            elif wrist_falling:
+                status += " | SHOULDER ADDUCTION"
+            put_text(img, status, (10, y), 0.43, FLEXION_COLOR) 
             y += 23
             draw_muscle_guide(img, shoulder, elbow, side, trend)
         put_text(img, "Flexion: angle decreases | Extension: angle increases", (10, img.shape[0] - 30), 0.42)
